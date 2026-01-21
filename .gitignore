@@ -1,0 +1,18 @@
+# virtual environments
+venv/
+.venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# deepface models / cache
+*.h5
+*.pkl
+
+# dataset (ไม่เอาขึ้น git)
+dataset/
+
+# images
+*.jpg
+*.png
