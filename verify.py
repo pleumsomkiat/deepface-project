@@ -4,17 +4,14 @@ from deepface import DeepFace
 DATASET_PATH = "dataset"
 MODEL_NAME = "Facenet512"
 DETECTOR = "opencv"
-
-# Facenet512 + cosine: ค่านี้จะ “เข้ม” และไม่ผ่านมั่วง่าย
-THRESHOLD = 0.35
-
+THRESHOLD = 0.35  # เข้ม ไม่ผ่านมั่วง่าย
 
 def verify_face(frame, enforce_detection=True):
     """
     รับ frame (ภาพจากกล้อง)
     คืนค่า:
-        (name, distance)  ถ้าพบคนใน dataset และผ่าน threshold
-        ("UNKNOWN", None) ถ้าไม่พบ / ไม่ผ่าน
+      (name, distance) ถ้าผ่าน
+      ("UNKNOWN", None/ระยะ) ถ้าไม่ผ่าน
     """
     try:
         results = DeepFace.find(
@@ -27,23 +24,20 @@ def verify_face(frame, enforce_detection=True):
             silent=True
         )
 
-        # results เป็น list ของ DataFrame
         if not results or results[0] is None or results[0].empty:
             return "UNKNOWN", None
 
         df = results[0].sort_values("distance", ascending=True)
         best = df.iloc[0]
 
-        distance = float(best["distance"])
+        dist = float(best["distance"])
         identity_path = str(best["identity"])
-
-        # dataset/<Name>/<image>.jpg  -> Name
         name = os.path.basename(os.path.dirname(identity_path)).strip()
 
-        if name and distance <= THRESHOLD:
-            return name, distance
+        if name and dist <= THRESHOLD:
+            return name, dist
 
-        return "UNKNOWN", distance
+        return "UNKNOWN", dist
 
     except Exception:
         return "UNKNOWN", None

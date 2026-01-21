@@ -1,18 +1,26 @@
-# virtual environments
-venv/
+# venv / env
 .venv/
-
-# python cache
+venv/
+venv_*/
+env_*/
+env_face/
+env_liveness/
 __pycache__/
 *.pyc
 
-# deepface models / cache
-*.h5
+# dataset & test images
+dataset/
+test.jpg
 *.pkl
 
-# dataset (ไม่เอาขึ้น git)
-dataset/
+# logs
+checkin_log.csv
+result.txt
 
-# images
-*.jpg
-*.png
+# OS
+.DS_Store
+Thumbs.db
+checkin_log.txt
+checkins.csv
+*.csv
+*.txt
