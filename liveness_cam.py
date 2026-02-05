@@ -8,20 +8,25 @@ import random
 import cv2
 import mediapipe as mp
 import numpy as np
-
 from PIL import ImageFont, ImageDraw, Image
 
-BLINK_REQUIRED = 2
-MOVE_REQUIRED = 2
+# ================== CONFIG ==================
+REPS_REQUIRED = 2        # ต้องทำท่าละ 2 ครั้ง
 TIMEOUT_SEC = 35
 CAM_INDEX = 0
 
-BLINK_THRESHOLD = 0.25
+BLINK_THRESHOLD = 0.25   # ยิ่งน้อยยิ่ง “กระพริบ” ยากขึ้น/ต้องปิดตามากขึ้น
 YAW_THRESHOLD = 0.04
 PITCH_THRESHOLD = 0.04
 
+# ถ้า "หันซ้าย/ขวา" มันสลับ ให้สลับตรงนี้:
+FLIP_LEFT_RIGHT = True
+
+# ===========================================
+
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+
 NOSE_TIP = 1
 LEFT_CHEEK = 234
 RIGHT_CHEEK = 454
@@ -40,12 +45,11 @@ def _get_font(size=28):
     return ImageFont.load_default()
 
 def draw_text_thai(bgr_img, text, x, y, size=28, color=(255, 255, 0)):
-    # color เป็น RGB
     img_rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(img_rgb)
     draw = ImageDraw.Draw(pil_img)
     font = _get_font(size)
-    draw.text((x, y), text, font=font, fill=color)
+    draw.text((x, y), text, font=font, fill=color)  # color เป็น RGB
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 # ---------- math ----------
@@ -57,6 +61,7 @@ def eye_aspect_ratio(lm, eye_idx):
     return (v1 + v2) / (2.0 * h + 1e-6)
 
 def head_pose(lm):
+    """คืน yaw, pitch แบบคร่าวๆ จาก landmark (ค่าประมาณ)"""
     nose = lm[NOSE_TIP]
     lch = lm[LEFT_CHEEK]
     rch = lm[RIGHT_CHEEK]
@@ -66,110 +71,100 @@ def head_pose(lm):
     cx = (lch.x + rch.x) / 2.0
     cy = (forehead.y + chin.y) / 2.0
 
-    # เดิม: yaw = nose.x - cx  # + ขวา, - ซ้าย (ในภาพ "ไม่ flip")
-    # แต่เราจะ flip ภาพให้เป็นกระจก => ต้องกลับเครื่องหมาย yaw เพื่อให้คำสั่งซ้าย/ขวาตรงกับที่เห็น
-    yaw = -(nose.x - cx)      # ✅ แก้ตรงนี้
-    pitch = nose.y - cy       # + ก้ม, - เงย
+    yaw = nose.x - cx      # + ขวา, - ซ้าย (โดยทั่วไป)
+    pitch = nose.y - cy    # + ก้ม, - เงย
     return yaw, pitch
 
+def move_to_text(m):
+    return {
+        "BLINK": "กระพริบตา",
+        "LEFT": "หันซ้าย",
+        "RIGHT": "หันขวา",
+        "UP": "เงยหน้า",
+        "DOWN": "ก้มหน้า",
+    }.get(m, m)
+
+def is_neutral(yaw, pitch):
+    return abs(yaw) < (YAW_THRESHOLD * 0.6) and abs(pitch) < (PITCH_THRESHOLD * 0.6)
+
 def detect_move(yaw, pitch, move):
+    # ถ้าสลับซ้ายขวา ให้ flip
+    if FLIP_LEFT_RIGHT:
+        yaw = -yaw
+
     if move == "LEFT":
-        return yaw > YAW_THRESHOLD   # ✅ สลับ
+        return yaw < -YAW_THRESHOLD
     if move == "RIGHT":
-        return yaw < -YAW_THRESHOLD  # ✅ สลับ
+        return yaw > YAW_THRESHOLD
     if move == "UP":
         return pitch < -PITCH_THRESHOLD
     if move == "DOWN":
         return pitch > PITCH_THRESHOLD
     return False
 
+def run_action(face_mesh, cap, action, reps_required=2, timeout_sec=35):
+    """
+    ทำ action เดียวให้ครบ reps_required
+    - ถ้า BLINK: นับกระพริบตาอย่างเดียว
+    - ถ้า MOVE: นับท่าอย่างเดียว (ไม่ต้องกระพริบตา)
+      โดยนับเมื่อ "ทำท่า" แล้ว "กลับ neutral"
+    """
+    start = time.time()
+    reps = 0
 
-def move_to_text(m):
-    return {"LEFT": "หันซ้าย", "RIGHT": "หันขวา", "UP": "เงยหน้า", "DOWN": "ก้มหน้า"}.get(m, m)
-
-def main():
-    cap = cv2.VideoCapture(CAM_INDEX)
-    if not cap.isOpened():
-        print("LIVENESS_FAIL")
-        return
-
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True, max_num_faces=1)
-
-    moves = ["LEFT", "RIGHT", "UP", "DOWN"]
-    random.shuffle(moves)
-    chosen = moves[:2]  # สุ่ม 2 ท่า
-
-    stage = "BLINK"
-    blink_count = 0
+    # สำหรับ blink
     eye_closed = False
 
-    current_move_index = 0
-    move_count = 0
-    move_ready = False  # ทำท่าถูกแล้ว รอ "กระพริบตา" เพื่อยืนยันนับ
-
-    start = time.time()
+    # สำหรับ move
+    in_pose = False  # อยู่ในท่าเป้าหมายอยู่หรือไม่
 
     while True:
+        if (time.time() - start) >= timeout_sec:
+            return False  # TIMEOUT
+
         ret, frame = cap.read()
         if not ret:
-            break
-
-        # ✅ แก้: flip ภาพแบบกระจก เพื่อให้ผู้ใช้ทำตามง่าย
-        frame = cv2.flip(frame, 1)
+            return False
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = face_mesh.process(rgb)
 
-        info1 = ""
-        info2 = ""
+        info1 = f"STEP 2: ทำท่า: {move_to_text(action)} ให้ครบ {reps_required} ครั้ง"
+        info2 = f"ความคืบหน้า: {reps}/{reps_required}"
         info3 = "กด Q เพื่อออก"
 
         if res.multi_face_landmarks:
             lm = res.multi_face_landmarks[0].landmark
 
-            # blink detect
-            ear = (eye_aspect_ratio(lm, LEFT_EYE) + eye_aspect_ratio(lm, RIGHT_EYE)) / 2.0
-            if ear < BLINK_THRESHOLD and not eye_closed:
-                eye_closed = True
-            elif ear >= BLINK_THRESHOLD and eye_closed:
-                blink_count += 1
-                eye_closed = False
+            if action == "BLINK":
+                ear = (eye_aspect_ratio(lm, LEFT_EYE) + eye_aspect_ratio(lm, RIGHT_EYE)) / 2.0
+                # ตรวจ “ปิดตา -> เปิดตา” = 1 blink
+                if ear < BLINK_THRESHOLD and not eye_closed:
+                    eye_closed = True
+                elif ear >= BLINK_THRESHOLD and eye_closed:
+                    reps += 1
+                    eye_closed = False
 
-                # ล็อกด้วยกระพริบตา: ถ้าท่าถูกแล้วค่อยนับ
-                if stage == "MOVE" and move_ready:
-                    move_count += 1
-                    move_ready = False
+            else:
+                yaw, pitch = head_pose(lm)
+                target_pose = detect_move(yaw, pitch, action)
 
-            yaw, pitch = head_pose(lm)
+                # เข้า pose
+                if target_pose and not in_pose:
+                    in_pose = True
 
-            if stage == "BLINK":
-                info1 = f"STEP 2: กรุณากระพริบตาให้ครบ {BLINK_REQUIRED} ครั้ง"
-                info2 = f"ตอนนี้: {blink_count}/{BLINK_REQUIRED}"
-                if blink_count >= BLINK_REQUIRED:
-                    stage = "MOVE"
-                    current_move_index = 0
-                    move_count = 0
-                    move_ready = False
+                # กลับ neutral -> นับ 1
+                if in_pose and is_neutral(yaw, pitch):
+                    reps += 1
+                    in_pose = False
 
-            elif stage == "MOVE":
-                target = chosen[current_move_index]
-                info1 = f"ทำท่า: {move_to_text(target)} {MOVE_REQUIRED} ครั้ง"
-                info2 = f"ความคืบหน้า: {move_count}/{MOVE_REQUIRED} (ทำท่าแล้วกระพริบตาเพื่อนับ)"
+            # ผ่านครบ
+            if reps >= reps_required:
+                frame = draw_text_thai(frame, "ผ่านท่านี้แล้ว ✅", 20, 130, size=30, color=(0, 255, 0))
+                cv2.imshow("STEP 2 - Liveness", frame)
+                cv2.waitKey(700)
+                return True
 
-                if detect_move(yaw, pitch, target):
-                    move_ready = True
-
-                if move_count >= MOVE_REQUIRED:
-                    current_move_index += 1
-                    move_count = 0
-                    move_ready = False
-
-                    if current_move_index >= len(chosen):
-                        print("LIVENESS_OK")
-                        cap.release()
-                        cv2.destroyAllWindows()
-                        return
         else:
             info1 = "ไม่พบใบหน้า กรุณาอยู่ในกล้อง"
             info2 = ""
@@ -181,22 +176,39 @@ def main():
         cv2.imshow("STEP 2 - Liveness", frame)
         key = cv2.waitKey(1) & 0xFF
         if key in [ord('q'), 27]:
-            break
+            return False
 
-        if (time.time() - start) >= TIMEOUT_SEC:
+def main():
+    cap = cv2.VideoCapture(CAM_INDEX)
+    if not cap.isOpened():
+        print("LIVENESS_FAIL")
+        return
+
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True, max_num_faces=1)
+
+    # ✅ สุ่ม 2 ท่า จาก 5 ท่า (รวม BLINK)
+    actions = ["BLINK", "LEFT", "RIGHT", "UP", "DOWN"]
+    random.shuffle(actions)
+    chosen = actions[:2]
+
+    ok_all = True
+    for idx, act in enumerate(chosen, start=1):
+        # ให้เวลาท่าละประมาณครึ่งหนึ่งของ TIMEOUT
+        per_action_timeout = max(10, TIMEOUT_SEC // len(chosen))
+
+        ok = run_action(face_mesh, cap, act, reps_required=REPS_REQUIRED, timeout_sec=per_action_timeout)
+        if not ok:
+            ok_all = False
             break
 
     cap.release()
     cv2.destroyAllWindows()
-    print("LIVENESS_FAIL")
 
-# ใส่ท้ายไฟล์ liveness_cam.py
-def run_liveness():
-    # เรียก main() เดิม แต่เปลี่ยนให้คืน True/False
-    # วิธีง่าย: ให้ main() print แล้วเราไม่ parse => ปรับ main() ให้ return True/False เลย
-    return main()
+    if ok_all:
+        print("LIVENESS_OK")
+    else:
+        print("LIVENESS_FAIL")
 
 if __name__ == "__main__":
-    ok = main()
-    print("LIVENESS_OK" if ok else "LIVENESS_FAIL")
-
+    main()
