@@ -6,12 +6,19 @@ from datetime import datetime
 
 from ai_face_cam import recognize_face_cam
 
+# =============== CONFIG ===============
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ENV_LIVENESS_PY = os.path.join(PROJECT_DIR, "env_liveness", "Scripts", "python.exe")
 LIVENESS_SCRIPT = os.path.join(PROJECT_DIR, "liveness_cam.py")
 
 LOG_FILE = os.path.join(PROJECT_DIR, "checkin_log.csv")
+
+# ---- API (เปิด/ปิดได้) ----
+USE_API = False
+API_URL = "http://localhost:3000/checkin"   # ปรับตาม server ของคุณ
+API_TIMEOUT_SEC = 5
+# =====================================
 
 def run_liveness():
     if not os.path.exists(ENV_LIVENESS_PY):
@@ -22,7 +29,6 @@ def run_liveness():
         print("ไม่พบไฟล์ liveness_cam.py")
         return False
 
-    # เรียก liveness ใน env_liveness
     p = subprocess.run(
         [ENV_LIVENESS_PY, LIVENESS_SCRIPT],
         capture_output=True,
@@ -31,7 +37,6 @@ def run_liveness():
     )
 
     out = (p.stdout or "").strip()
-    # print(out)  # ถ้าอยากดู log
     return "LIVENESS_OK" in out
 
 def append_log(name, dist1, dist3, status):
@@ -45,6 +50,24 @@ def append_log(name, dist1, dist3, status):
             w.writerow(header)
         w.writerow(row)
 
+def send_to_api(name, status, dist1=None, dist3=None):
+    if not USE_API:
+        return
+
+    try:
+        import requests  # import ตรงนี้ เผื่อเครื่องที่ไม่ใช้ API จะไม่ต้องลง requests
+        payload = {
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "name": name,
+            "status": status,
+            "distance_step1": dist1,
+            "distance_step3": dist3,
+        }
+        r = requests.post(API_URL, json=payload, timeout=API_TIMEOUT_SEC)
+        print(f"API => {r.status_code}: {r.text}")
+    except Exception as e:
+        print("API error:", e)
+
 def check_in_flow():
     print("\nSTEP 1: ยืนยันตัวตนรอบแรก (15 วินาที)")
     name1, dist1 = recognize_face_cam(timeout_sec=15, show_window=True)
@@ -52,6 +75,7 @@ def check_in_flow():
     if name1 == "UNKNOWN":
         print("FAIL: ไม่ผ่านการยืนยันตัวตน (UNKNOWN)")
         append_log("UNKNOWN", dist1, None, "FAIL_STEP1")
+        send_to_api("UNKNOWN", "FAIL_STEP1", dist1, None)
         return
 
     print(f"PASS: พบตัวตน = {name1} (dist={dist1})")
@@ -61,6 +85,7 @@ def check_in_flow():
     if not ok_live:
         print("FAIL: ไม่ผ่าน Liveness")
         append_log(name1, dist1, None, "FAIL_LIVENESS")
+        send_to_api(name1, "FAIL_LIVENESS", dist1, None)
         return
 
     print("PASS: Liveness ผ่าน")
@@ -68,14 +93,15 @@ def check_in_flow():
     print("\nSTEP 3: ยืนยันตัวตนอีกรอบ (15 วินาที)")
     name3, dist3 = recognize_face_cam(timeout_sec=15, show_window=True)
 
-    # ต้องตรงคนเดิมเท่านั้น
     if name3 != name1:
         print(f"FAIL: รอบสุดท้ายไม่ตรง (ได้ {name3})")
         append_log(name1, dist1, dist3, "FAIL_STEP3_MISMATCH")
+        send_to_api(name1, "FAIL_STEP3_MISMATCH", dist1, dist3)
         return
 
     print(f"PASS: ยืนยันตัวตนครบ ระบบบันทึกเช็คชื่อให้แล้ว ({name3})")
     append_log(name3, dist1, dist3, "SUCCESS")
+    send_to_api(name3, "SUCCESS", dist1, dist3)
 
 def menu():
     while True:
