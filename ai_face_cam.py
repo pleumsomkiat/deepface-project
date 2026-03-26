@@ -1,41 +1,39 @@
-# ai_face_cam.py
 import os
 import time
+from collections import Counter, deque
+
 import cv2
-from deepface import DeepFace
-
-from PIL import ImageFont, ImageDraw, Image
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
-# ================== CONFIG ==================
-DATASET_PATH = "dataset"
-MODEL_NAME = "Facenet512"
-DETECTOR = "opencv"
-DISTANCE_METRIC = "cosine"
+from verify import verify_face
 
-# ยิ่งต่ำยิ่งเข้มงวด (Facenet512+cosine มักอยู่ราวๆ 0.30-0.40)
-THRESHOLD = 0.35
 
-TIMEOUT_SEC = 15
+TIMEOUT_SEC = 10
 CAM_INDEX = 0
-
-# Windows แนะนำ CAP_DSHOW (ถ้าเครื่องคุณใช้ MSMF ดีกว่า ให้เปลี่ยนเป็น cv2.CAP_MSMF)
 CAP_BACKEND = cv2.CAP_DSHOW
+CHECK_INTERVAL_SEC = 0.5
+MATCH_WINDOW_SIZE = 4
+MIN_CONFIRMATIONS = 2
 
-# ตรวจหน้าไม่ถี่เกิน (DeepFace.find หนัก)
-CHECK_INTERVAL_SEC = 0.7
-# ===========================================
+CASCADE_SCALE_FACTOR = 1.1
+CASCADE_MIN_NEIGHBORS = 4
+CASCADE_MIN_SIZE = (60, 60)
+CASCADE_FALLBACKS = [
+    ("haarcascade_frontalface_default.xml", 1.1, 4, (60, 60)),
+    ("haarcascade_frontalface_alt2.xml", 1.05, 3, (45, 45)),
+    ("haarcascade_profileface.xml", 1.1, 4, (60, 60)),
+]
 
 
-# ------------------ Thai text helper (PIL) ------------------
 def _get_font(size=32):
     candidates = [
         r"C:\Windows\Fonts\tahoma.ttf",
         r"C:\Windows\Fonts\arial.ttf",
     ]
-    for p in candidates:
-        if os.path.exists(p):
-            return ImageFont.truetype(p, size)
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
     return ImageFont.load_default()
 
 
@@ -44,84 +42,82 @@ def draw_text_thai(bgr_img, text, x, y, size=32, color=(255, 255, 0)):
     pil_img = Image.fromarray(img_rgb)
     draw = ImageDraw.Draw(pil_img)
     font = _get_font(size)
-    draw.text((x, y), text, font=font, fill=color)  # color เป็น RGB
+    draw.text((x, y), text, font=font, fill=color)
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 
-# ------------------ Face detect (bbox) ------------------
-_face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+_face_cascades = [
+    (
+        cv2.CascadeClassifier(cv2.data.haarcascades + cascade_name),
+        scale_factor,
+        min_neighbors,
+        min_size,
+    )
+    for cascade_name, scale_factor, min_neighbors, min_size in CASCADE_FALLBACKS
+]
 
 
 def detect_face_bbox(frame_bgr):
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces = _face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80))
-    if len(faces) == 0:
-        return None
-    # เลือกหน้าที่ใหญ่สุด
-    x, y, w, h = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[0]
-    return (x, y, w, h)
+    gray = cv2.equalizeHist(gray)
+
+    best_face = None
+    best_area = -1
+
+    for cascade, scale_factor, min_neighbors, min_size in _face_cascades:
+        faces = cascade.detectMultiScale(
+            gray,
+            scaleFactor=scale_factor,
+            minNeighbors=min_neighbors,
+            minSize=min_size,
+        )
+        for x, y, w, h in faces:
+            area = int(w) * int(h)
+            if area > best_area:
+                best_face = (int(x), int(y), int(w), int(h))
+                best_area = area
+
+    return best_face
 
 
 def verify_face_from_crop(face_bgr):
-    """
-    รับรูปหน้าที่ crop แล้ว
-    คืนค่า: (name, distance) หรือ ("UNKNOWN", None)
-    """
     if face_bgr is None or face_bgr.size == 0:
         return "UNKNOWN", None
+    return verify_face(face_bgr, enforce_detection=False)
 
-    try:
-        results = DeepFace.find(
-            img_path=face_bgr,
-            db_path=DATASET_PATH,
-            model_name=MODEL_NAME,
-            detector_backend=DETECTOR,
-            distance_metric=DISTANCE_METRIC,
-            enforce_detection=False,
-            silent=True,
-            refresh_database=False,  # ไม่ rebuild db ทุกครั้ง (เร็วขึ้น)
-        )
 
-        if not results or results[0] is None or results[0].empty:
-            return "UNKNOWN", None
+def _choose_confirmed_match(recent_matches):
+    known_matches = [(name, dist) for name, dist in recent_matches if name != "UNKNOWN" and dist is not None]
+    if not known_matches:
+        return "UNKNOWN", None, 0
 
-        df = results[0].sort_values("distance", ascending=True)
-        best = df.iloc[0]
+    counts = Counter(name for name, _dist in known_matches)
+    ranked_names = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    top_name, top_votes = ranked_names[0]
+    runner_up_votes = ranked_names[1][1] if len(ranked_names) > 1 else 0
 
-        dist = float(best["distance"])
-        identity_path = str(best["identity"])
-        name = os.path.basename(os.path.dirname(identity_path)).strip()
+    if top_votes < MIN_CONFIRMATIONS or top_votes <= runner_up_votes:
+        return "UNKNOWN", None, top_votes
 
-        if name and dist <= THRESHOLD:
-            return name, dist
-
-        return "UNKNOWN", dist
-
-    except Exception as e:
-        # ปล่อยไว้ให้ดูสาเหตุได้ตอน debug
-        # print("verify_face_from_crop error:", e)
-        return "UNKNOWN", None
+    distances = [dist for name, dist in known_matches if name == top_name]
+    return top_name, min(distances), top_votes
 
 
 def recognize_face_cam(timeout_sec=TIMEOUT_SEC, show_window=True, cam_index=CAM_INDEX):
-    """
-    เปิดกล้องแล้วพยายามยืนยันตัวตนภายในเวลาที่กำหนด
-    คืนค่า: (best_name, best_dist)
-    """
     cap = cv2.VideoCapture(cam_index, CAP_BACKEND)
     if not cap.isOpened():
         return "UNKNOWN", None
 
     start = time.time()
-    last_check_time = 0
+    last_check_time = 0.0
 
-    best_name = "UNKNOWN"
-    best_dist = None
+    confirmed_name = "UNKNOWN"
+    confirmed_dist = None
+    confirmed_votes = 0
 
     last_seen_name = "UNKNOWN"
     last_seen_dist = None
+    recent_matches = deque(maxlen=MATCH_WINDOW_SIZE)
     bbox = None
 
     while True:
@@ -129,23 +125,31 @@ def recognize_face_cam(timeout_sec=TIMEOUT_SEC, show_window=True, cam_index=CAM_
         if not ret:
             break
 
-        bbox = detect_face_bbox(frame)
-
         now = time.time()
-        if bbox is not None and (now - last_check_time) >= CHECK_INTERVAL_SEC:
-            x, y, w, h = bbox
-            face_crop = frame[max(0, y): y + h, max(0, x): x + w]
-            name, dist = verify_face_from_crop(face_crop)
-
+        if (now - last_check_time) >= CHECK_INTERVAL_SEC:
+            bbox = detect_face_bbox(frame)
+            name, dist = verify_face(frame, enforce_detection=False)
+            recent_matches.append((name, dist))
             last_seen_name = name
             last_seen_dist = dist
             last_check_time = now
 
-            # เก็บ "ผลดีที่สุด" ตาม distance (ยิ่งต่ำยิ่งดี) เฉพาะที่เป็นคนจริง
-            if name != "UNKNOWN" and dist is not None:
-                if best_dist is None or dist < best_dist:
-                    best_name = name
-                    best_dist = dist
+            candidate_name, candidate_dist, candidate_votes = _choose_confirmed_match(recent_matches)
+            if candidate_name != "UNKNOWN":
+                should_replace = (
+                    candidate_votes > confirmed_votes
+                    or (
+                        candidate_votes == confirmed_votes
+                        and candidate_dist is not None
+                        and (confirmed_dist is None or candidate_dist < confirmed_dist)
+                    )
+                )
+                if should_replace:
+                    confirmed_name = candidate_name
+                    confirmed_dist = candidate_dist
+                    confirmed_votes = candidate_votes
+        elif bbox is None:
+            bbox = detect_face_bbox(frame)
 
         if show_window:
             disp = frame.copy()
@@ -154,16 +158,18 @@ def recognize_face_cam(timeout_sec=TIMEOUT_SEC, show_window=True, cam_index=CAM_
                 x, y, w, h = bbox
                 cv2.rectangle(disp, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-            best_txt = "N/A" if best_dist is None else f"{best_dist:.3f}"
+            confirmed_txt = "N/A" if confirmed_dist is None else f"{confirmed_dist:.3f}"
             last_txt = "N/A" if last_seen_dist is None else f"{last_seen_dist:.3f}"
 
-            line1 = f"BEST: {best_name}  dist:{best_txt}"
+            line1 = f"CONFIRMED: {confirmed_name}  dist:{confirmed_txt}"
             line2 = f"LAST: {last_seen_name}  dist:{last_txt}"
-            line3 = "กด Q เพื่อออก (หรือรอให้ครบเวลา)"
+            line3 = f"WINDOW VOTES: {confirmed_votes}/{MATCH_WINDOW_SIZE}"
+            line4 = "Press Q or ESC to exit"
 
             disp = draw_text_thai(disp, line1, 20, 20, size=32, color=(255, 255, 0))
             disp = draw_text_thai(disp, line2, 20, 60, size=28, color=(255, 255, 0))
             disp = draw_text_thai(disp, line3, 20, 100, size=26, color=(255, 255, 0))
+            disp = draw_text_thai(disp, line4, 20, 135, size=24, color=(255, 255, 0))
 
             cv2.imshow("Face Recognition", disp)
             key = cv2.waitKey(1) & 0xFF
@@ -176,7 +182,7 @@ def recognize_face_cam(timeout_sec=TIMEOUT_SEC, show_window=True, cam_index=CAM_
     cap.release()
     cv2.destroyAllWindows()
 
-    return best_name, best_dist
+    return confirmed_name, confirmed_dist
 
 
 if __name__ == "__main__":

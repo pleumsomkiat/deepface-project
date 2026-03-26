@@ -1,0 +1,5 @@
+# Separate runtime for liveness because mediapipe's protobuf
+# constraints conflict with the tensorflow/deepface stack.
+mediapipe==0.10.9
+opencv-python==4.13.0.90
+Pillow==12.1.0

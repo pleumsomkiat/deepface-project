@@ -1,0 +1,11 @@
+{
+  "Bank": {
+    "user_id": "65010001",
+    "full_name": "Bank"
+  },
+  "Gift": {
+    "user_id": "65010002",
+    "full_name": "Gift"
+  },
+  "Tan": "65010003"
+}

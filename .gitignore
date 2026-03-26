@@ -10,8 +10,13 @@ __pycache__/
 
 # dataset & test images
 dataset/
+dataset_drive_cache/
+dataset_drive_cache_staging/
 test.jpg
 *.pkl
+.dataset_source.json
+attendance_backend/
+user_mapping.json
 
 # logs
 checkin_log.csv
